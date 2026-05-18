@@ -1,7 +1,8 @@
-import language
-import neural
+from . import cognition, language, memory, neural
 
 __all__ = [
+    "cognition",
     "language",
-    "neural"
+    "memory",
+    "neural",
 ]
