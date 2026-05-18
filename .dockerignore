@@ -1,0 +1,10 @@
+# Local secrets — never bake into container images (use Compose env / `-e`).
+.env
+.env.example
+.env.*
+
+# Optional build-context hygiene
+.git
+.venv
+**/__pycache__
+*.pyc

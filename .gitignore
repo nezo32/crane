@@ -11,3 +11,6 @@ wheels/
 
 # Training outputs
 checkpoints/
+.env
+data/
+checkpoints/

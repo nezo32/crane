@@ -112,6 +112,22 @@ class MemoryGraphStore(ABC):
         """
         raise NotImplementedError
 
+    def export_snapshot(self) -> dict[str, Any]:
+        """
+        Serialize the full vector-graph memory for checkpoint / restore.
+
+        Implemented by backends that persist to external stores (Neo4j).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement export_snapshot()"
+        )
+
+    def import_snapshot(self, data: dict[str, Any]) -> None:
+        """Restore graph state from ``export_snapshot`` output."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement import_snapshot()"
+        )
+
 
 __all__ = [
     "MemoryGraphStore",

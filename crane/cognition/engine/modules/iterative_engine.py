@@ -1,7 +1,9 @@
 from itertools import combinations
-from typing import Any
+from typing import Any, Iterator, Sequence
 
 import torch
+from torch import nn
+from torch.nn import functional as F
 
 from crane.language.embeddings.base.embedder import Embedder
 from crane.language.tokenization.base.tokenizer import Tokenizer
@@ -27,7 +29,19 @@ class IterativeCognitiveEngine(CognitiveEngine):
 
     Each iteration injects the previous thought back as a virtual token so the
     next salient extraction sees the in-progress hypothesis.
+
+    Training uses a single cognitive pass with gradients enabled; the iterative
+    loop is reserved for inference / test-time compute.
     """
+
+    _TRAINABLE_MODULE_ATTRS = (
+        "_embedder",
+        "_salient",
+        "_fusion",
+        "_reasoner",
+        "_thought_head",
+        "_decoder",
+    )
 
     def __init__(
         self,
@@ -62,22 +76,71 @@ class IterativeCognitiveEngine(CognitiveEngine):
 
         self._bos_id = getattr(tokenizer, "bos_id", 1)
         self._eos_id = getattr(tokenizer, "eos_id", 2)
+        self._pad_id = getattr(tokenizer, "pad_id", 0)
 
         self._global_step = 0
         self._last_used_ids: list[str] = []
 
-        for module in (salient, fusion, reasoner, thought_head, decoder):
-            if hasattr(module, "to"):
-                module.to(self._device)
-            if hasattr(module, "eval"):
-                module.eval()
-        if hasattr(embedder, "to"):
-            embedder.to(self._device)
-        if hasattr(embedder, "eval"):
-            embedder.eval()
+        for module in self._iter_modules():
+            module.to(self._device)
+        self._set_training(False)
+
+    def trainable_parameters(self) -> Iterator[nn.Parameter]:
+        """Iterate over every learnable parameter the engine owns."""
+        for module in self._iter_modules():
+            yield from module.parameters()
+
+    @property
+    def training_step(self) -> int:
+        """Monotonic counter updated during ``train_step*`` memory hygiene."""
+        return self._global_step
+
+    def set_training_step(self, n: int) -> None:
+        """Use when restoring from a checkpoint (completed optimizer steps)."""
+        self._global_step = int(n)
+
+    def module_state_dict(self) -> dict[str, Any]:
+        """State dict for all ``nn.Module`` components (CPU tensors)."""
+        out: dict[str, Any] = {}
+        pairs = (
+            ("embedder", "_embedder"),
+            ("salient", "_salient"),
+            ("fusion", "_fusion"),
+            ("reasoner", "_reasoner"),
+            ("thought_head", "_thought_head"),
+            ("decoder", "_decoder"),
+        )
+        for key, attr in pairs:
+            mod = getattr(self, attr)
+            if isinstance(mod, nn.Module):
+                out[key] = {k: v.cpu() for k, v in mod.state_dict().items()}
+        return out
+
+    def load_module_state_dict(
+        self,
+        state: dict[str, Any],
+        *,
+        strict: bool = True,
+    ) -> None:
+        mapping = (
+            ("embedder", "_embedder"),
+            ("salient", "_salient"),
+            ("fusion", "_fusion"),
+            ("reasoner", "_reasoner"),
+            ("thought_head", "_thought_head"),
+            ("decoder", "_decoder"),
+        )
+        for key, attr in mapping:
+            if key not in state:
+                continue
+            mod = getattr(self, attr)
+            if isinstance(mod, nn.Module):
+                mod.load_state_dict(state[key], strict=strict)
 
     @torch.no_grad()
     def think(self, text: str) -> str:
+        self._set_training(False)
+
         ids = self._tokenizer.encode(text)
         token_ids = torch.tensor([ids], dtype=torch.long, device=self._device)
         x = self._embedder.embed_tokens(token_ids)
@@ -87,35 +150,11 @@ class IterativeCognitiveEngine(CognitiveEngine):
 
         for step in range(self._config.max_iterations):
             x_iter = x if thought is None else self._inject_thought(x, thought)
-            salient = self._salient(x_iter)
-            query = salient.mean(dim=1).squeeze(0)
-
-            result = self._memory.retrieve(
-                query=query.detach().cpu(),
-                k=self._config.memory_top_k,
-                hops=self._config.memory_hops,
-            )
-            scores = self._significance.score(query.detach().cpu(), result)
-
-            mem_vectors, mem_weights, used_ids = self._pick_top_m(result, scores)
-
-            if used_ids and self._config.activation_bump > 0:
-                self._memory.bump_activation(used_ids, self._config.activation_bump)
-
-            mem_vectors = mem_vectors.to(self._device)
-            mem_weights_t = mem_weights.to(self._device)
-
-            fused = self._fusion(
-                x_iter,
-                mem_vectors.unsqueeze(0),
-                mem_weights_t.unsqueeze(0) if mem_weights_t.numel() > 0 else None,
-            )
-            state = self._reasoner(fused)
-            thought, confidence = self._thought_head(state)
+            thought, confidence, used_ids, used_weights = self._cognitive_step(x_iter)
 
             confidence_value = float(confidence.mean().item())
             if confidence_value >= self._config.write_confidence_min:
-                self._write_back(thought, used_ids, mem_weights, step)
+                self._write_back(thought.detach(), used_ids, used_weights)
                 last_used = used_ids
 
             if self._config.decay_factor < 1.0:
@@ -140,15 +179,109 @@ class IterativeCognitiveEngine(CognitiveEngine):
         )
         return self._tokenizer.decode(out_ids[0].tolist())
 
+    def train_step(
+        self,
+        input_text: str,
+        target_text: str,
+        *,
+        update_memory: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Text-input variant of `train_step_ids` — encodes both arguments via
+        the engine's tokenizer (which adds BOS/EOS), then delegates.
+        """
+        input_ids = self._tokenizer.encode(input_text)
+        target_ids = self._tokenizer.encode(target_text)
+        return self.train_step_ids(
+            input_ids, target_ids, update_memory=update_memory
+        )
+
+    def train_step_ids(
+        self,
+        input_ids: Sequence[int] | torch.Tensor,
+        target_ids: Sequence[int] | torch.Tensor,
+        *,
+        update_memory: bool = True,
+    ) -> dict[str, Any]:
+        """
+        One supervised training step for next-token prediction.
+
+        - Runs a SINGLE cognitive pass over `input_ids` with gradients
+          enabled (no multi-iteration unroll).
+        - Teacher-forces the decoder on `target_ids` and returns CE loss.
+          The caller is responsible for the leading BOS in `target_ids`:
+          the decoder is fed `target_ids[:-1]` and predicts `target_ids[1:]`.
+        - If `update_memory` is True, runs the usual write/reinforce/decay/
+          prune hygiene exactly as inference would.
+
+        Returns:
+            {
+                "loss":       Tensor (scalar, has grad — caller .backward()s),
+                "logits":     Tensor (B, T, V),
+                "n_tokens":   non-pad target tokens used in the loss,
+                "confidence": float — mean confidence on the produced thought,
+            }
+        """
+        self._set_training(True)
+
+        input_tensor = self._to_id_tensor(input_ids)
+        target_tensor = self._to_id_tensor(target_ids)
+
+        if target_tensor.size(1) < 2:
+            raise ValueError(
+                "target_ids must contain at least 2 tokens (e.g. [BOS, t0])"
+            )
+
+        x = self._embedder.embed_tokens(input_tensor)
+        thought, confidence, used_ids, used_weights = self._cognitive_step(x)
+
+        decoder_input = target_tensor[:, :-1]
+        decoder_target = target_tensor[:, 1:]
+
+        logits = self._decoder(thought, decoder_input)
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            decoder_target.reshape(-1),
+            ignore_index=self._pad_id,
+        )
+
+        n_tokens = int((decoder_target != self._pad_id).sum().item())
+        confidence_value = float(confidence.mean().item())
+
+        if update_memory:
+            if confidence_value >= self._config.write_confidence_min:
+                self._write_back(thought.detach(), used_ids, used_weights)
+                self._last_used_ids = used_ids
+            if self._config.decay_factor < 1.0:
+                self._memory.decay(self._config.decay_factor)
+            self._global_step += 1
+            self._maybe_prune()
+
+        return {
+            "loss": loss,
+            "logits": logits,
+            "n_tokens": n_tokens,
+            "confidence": confidence_value,
+        }
+
+    def _to_id_tensor(
+        self,
+        ids: Sequence[int] | torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(ids, torch.Tensor):
+            t = ids.to(self._device, dtype=torch.long)
+            if t.dim() == 1:
+                t = t.unsqueeze(0)
+            return t
+        return torch.tensor([list(ids)], dtype=torch.long, device=self._device)
+
     def feedback(self, score: float) -> None:
         """
-        Apply prediction-error driven reinforcement to the last `think()` call.
+        Apply prediction-error driven reinforcement to the last write.
 
         Positive `score` strengthens associations between memory units that
         co-activated to produce the final thought; negative `score` weakens
         them. The magnitude is `score * config.feedback_strength`.
-
-        No-op if no usable memory was retrieved in the last call.
         """
         if not self._last_used_ids or len(self._last_used_ids) < 2:
             return
@@ -166,6 +299,44 @@ class IterativeCognitiveEngine(CognitiveEngine):
         bump = self._config.activation_bump * float(score)
         if bump != 0.0:
             self._memory.bump_activation(self._last_used_ids, bump)
+
+    def _cognitive_step(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[str], torch.Tensor]:
+        """
+        One forward pass: salient -> retrieve -> significance -> fuse ->
+        reason -> thought_head. Returns (thought, confidence, used_ids,
+        used_weights). Side-effects: activation bump on retrieved seeds.
+        Gradients flow normally through neural modules; memory tensors enter
+        the graph detached.
+        """
+        salient = self._salient(x)
+        query = salient.mean(dim=1).squeeze(0)
+        query_cpu = query.detach().cpu()
+
+        result = self._memory.retrieve(
+            query=query_cpu,
+            k=self._config.memory_top_k,
+            hops=self._config.memory_hops,
+        )
+        scores = self._significance.score(query_cpu, result)
+        mem_vectors, mem_weights, used_ids = self._pick_top_m(result, scores)
+
+        if used_ids and self._config.activation_bump > 0:
+            self._memory.bump_activation(used_ids, self._config.activation_bump)
+
+        mem_vectors = mem_vectors.to(self._device)
+        mem_weights_dev = mem_weights.to(self._device)
+
+        fused = self._fusion(
+            x,
+            mem_vectors.unsqueeze(0),
+            mem_weights_dev.unsqueeze(0) if mem_weights_dev.numel() > 0 else None,
+        )
+        state = self._reasoner(fused)
+        thought, confidence = self._thought_head(state)
+        return thought, confidence, used_ids, mem_weights
 
     def _inject_thought(
         self,
@@ -197,7 +368,6 @@ class IterativeCognitiveEngine(CognitiveEngine):
         thought: torch.Tensor,
         used_ids: list[str],
         used_weights: torch.Tensor,
-        step: int,
     ) -> None:
         new_marker = "<new:0>"
         links: list[tuple[str, str, float]] = []
@@ -207,7 +377,7 @@ class IterativeCognitiveEngine(CognitiveEngine):
                 links.append((nid, new_marker, float(w)))
                 links.append((new_marker, nid, float(w)))
 
-        payload: list[dict[str, Any]] = [{"step": int(step)}]
+        payload: list[dict[str, Any]] = [{"step": int(self._global_step)}]
         thought_cpu = thought.detach().cpu().to(torch.float32)
 
         self._memory.write(
@@ -234,6 +404,16 @@ class IterativeCognitiveEngine(CognitiveEngine):
             min_node_activation=self._config.min_node_activation,
             max_nodes=self._config.max_nodes,
         )
+
+    def _iter_modules(self) -> Iterator[nn.Module]:
+        for attr in self._TRAINABLE_MODULE_ATTRS:
+            module = getattr(self, attr)
+            if isinstance(module, nn.Module):
+                yield module
+
+    def _set_training(self, mode: bool) -> None:
+        for module in self._iter_modules():
+            module.train(mode)
 
 
 __all__ = [

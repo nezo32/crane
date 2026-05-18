@@ -64,6 +64,24 @@ class Neo4jMemoryGraphStore(MemoryGraphStore):
                 f"CREATE CONSTRAINT {self._label}_id_unique IF NOT EXISTS "
                 f"FOR (n:{self._label}) REQUIRE n.id IS UNIQUE"
             )
+
+            existing = session.run(
+                "SHOW VECTOR INDEXES YIELD name, options "
+                "WHERE name = $name "
+                "RETURN options",
+                name=self._index,
+            ).single()
+            if existing is not None:
+                cfg = (existing["options"] or {}).get("indexConfig", {})
+                existing_dim = int(cfg.get("vector.dimensions", -1))
+                if existing_dim != self._dim:
+                    raise RuntimeError(
+                        f"Neo4j vector index {self._index!r} exists with "
+                        f"dim={existing_dim}, but requested dim={self._dim}. "
+                        f"Run `uv run python pipelines/wipe_memory.py` to "
+                        f"reset the graph and recreate the index."
+                    )
+
             session.run(
                 f"CREATE VECTOR INDEX {self._index} IF NOT EXISTS "
                 f"FOR (n:{self._label}) ON (n.vector) "
@@ -72,6 +90,20 @@ class Neo4jMemoryGraphStore(MemoryGraphStore):
                 f"`vector.similarity_function`: 'cosine' }} }}",
                 dim=self._dim,
             )
+
+    def wipe(self) -> None:
+        """
+        Delete all MemoryUnit nodes and edges. Drop vector index so a new
+        ``dim`` can be applied later, drop the id uniqueness constraint so it
+        can be recreated, then recreate constraint + vector index via
+        ``_ensure_schema``.
+        """
+        constraint = f"{self._label}_id_unique"
+        with self._driver.session(database=self._database) as session:
+            session.run(f"MATCH (n:{self._label}) DETACH DELETE n")
+            session.run(f"DROP INDEX {self._index} IF EXISTS")
+            session.run(f"DROP CONSTRAINT {constraint} IF EXISTS")
+        self._ensure_schema()
 
     def retrieve(
         self,
@@ -341,6 +373,136 @@ class Neo4jMemoryGraphStore(MemoryGraphStore):
                     nodes_deleted += int(rec["deleted"])
 
         return {"edges_deleted": edges_deleted, "nodes_deleted": nodes_deleted}
+
+    _SNAPSHOT_VERSION = 1
+    _IMPORT_BATCH = 512
+
+    def export_snapshot(self) -> dict[str, Any]:
+        with self._driver.session(database=self._database) as session:
+            node_recs = list(
+                session.run(
+                    f"MATCH (n:{self._label}) "
+                    f"RETURN n.id AS id, n.vector AS vector, n.payload AS payload, "
+                    f"n.created_at AS created_at, coalesce(n.activation, 0.0) AS activation "
+                    f"ORDER BY n.id"
+                )
+            )
+            edge_recs = list(
+                session.run(
+                    f"MATCH (a:{self._label})-[r:{self._edge}]->(b:{self._label}) "
+                    f"RETURN a.id AS src, b.id AS dst, "
+                    f"coalesce(r.weight, 0.0) AS weight, "
+                    f"coalesce(r.last_used, 0) AS last_used"
+                )
+            )
+
+        nodes_out: list[dict[str, Any]] = []
+        for rec in node_recs:
+            vec = list(rec["vector"])
+            if len(vec) != self._dim:
+                raise ValueError(
+                    f"node {rec['id']!r} has vector len {len(vec)}, expected {self._dim}"
+                )
+            payload = rec["payload"]
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8", errors="replace")
+            ct = rec["created_at"]
+            if ct is not None:
+                ct = int(ct)
+            nodes_out.append(
+                {
+                    "id": str(rec["id"]),
+                    "vector": vec,
+                    "payload": payload if isinstance(payload, str) else json.dumps(payload),
+                    "created_at": ct,
+                    "activation": float(rec["activation"]),
+                }
+            )
+
+        edges_out = [
+            {
+                "src": str(er["src"]),
+                "dst": str(er["dst"]),
+                "weight": float(er["weight"]),
+                "last_used": int(er["last_used"] or 0),
+            }
+            for er in edge_recs
+        ]
+
+        return {
+            "snapshot_version": self._SNAPSHOT_VERSION,
+            "dim": self._dim,
+            "nodes": nodes_out,
+            "edges": edges_out,
+        }
+
+    def import_snapshot(self, data: dict[str, Any]) -> None:
+        if int(data.get("snapshot_version", 0)) != self._SNAPSHOT_VERSION:
+            raise ValueError(f"unsupported snapshot_version {data.get('snapshot_version')!r}")
+        if int(data["dim"]) != self._dim:
+            raise ValueError(
+                f"snapshot dim {data['dim']} does not match store dim {self._dim}"
+            )
+        nodes: list[Any] = data.get("nodes") or []
+        edges: list[Any] = data.get("edges") or []
+
+        merge_nodes = (
+            f"UNWIND $rows AS row "
+            f"MERGE (n:{self._label} {{ id: row.id }}) "
+            f"SET n.vector = row.vector, n.payload = row.payload, "
+            f"n.created_at = row.created_at, n.activation = row.activation"
+        )
+        merge_edges = (
+            f"UNWIND $rows AS row "
+            f"MATCH (a:{self._label} {{ id: row.src }}), "
+            f"      (b:{self._label} {{ id: row.dst }}) "
+            f"MERGE (a)-[r:{self._edge}]->(b) "
+            f"SET r.weight = row.weight, r.last_used = row.last_used"
+        )
+
+        with self._driver.session(database=self._database) as session:
+            for i in range(0, len(nodes), self._IMPORT_BATCH):
+                batch = nodes[i : i + self._IMPORT_BATCH]
+                rows: list[dict[str, Any]] = []
+                for row in batch:
+                    vec = list(row["vector"])
+                    if len(vec) != self._dim:
+                        raise ValueError(
+                            f"snapshot node {row.get('id')!r} vector len mismatch"
+                        )
+                    pl_raw = row.get("payload", "")
+                    if isinstance(pl_raw, dict):
+                        pl = json.dumps(pl_raw)
+                    else:
+                        pl = str(pl_raw)
+                    ct = row.get("created_at")
+                    if ct is None:
+                        ct = 0
+                    else:
+                        ct = int(ct)
+                    rows.append(
+                        {
+                            "id": str(row["id"]),
+                            "vector": vec,
+                            "payload": pl,
+                            "created_at": ct,
+                            "activation": float(row.get("activation", 0.0)),
+                        }
+                    )
+                session.run(merge_nodes, rows=rows)
+
+            for i in range(0, len(edges), self._IMPORT_BATCH):
+                batch = edges[i : i + self._IMPORT_BATCH]
+                erows = [
+                    {
+                        "src": str(e["src"]),
+                        "dst": str(e["dst"]),
+                        "weight": float(e["weight"]),
+                        "last_used": int(e.get("last_used", 0) or 0),
+                    }
+                    for e in batch
+                ]
+                session.run(merge_edges, rows=erows)
 
     def _empty_result(self) -> RetrievalResult:
         return RetrievalResult(
