@@ -1,18 +1,16 @@
 """
 Inference demo for CRANE.
 
-Loads the trained BPE tokenizer + model dims that match `train.py` so a
-checkpoint produced by training can be served from here. If no tokenizer
-exists yet, falls back to the byte-level CharTokenizer so the demo still
-runs against random weights.
+Loads ``checkpoints/latest.pt`` when present (weights + optional Neo4j snapshot).
+Uses the multi-iteration ``think()`` loop for generation.
 """
 
 import os
+from pathlib import Path
 
 import torch
 
 from crane.config import load_dotenv_if_present
-
 from crane.cognition.engine.base.engine import EngineConfig
 from crane.cognition.engine.modules.iterative_engine import IterativeCognitiveEngine
 from crane.language.embeddings.modules.lookup_embedder import LookupEmbedder
@@ -33,6 +31,8 @@ from crane.neural.salient.modules.attention_pool_extractor import (
 )
 from crane.neural.thought.modules.linear_thought_head import LinearThoughtHead
 
+from checkpoint import load_checkpoint_for_inference
+
 
 load_dotenv_if_present()
 
@@ -45,6 +45,10 @@ DECODER_LAYERS = 4
 DECODER_MAX_LEN = 128
 
 TOKENIZER_NAME = "gpt2"
+
+CHECKPOINT_PATH = Path(
+    os.environ.get("CRANE_CHECKPOINT_PATH", "checkpoints/latest.pt")
+).resolve()
 
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
@@ -65,8 +69,7 @@ def load_tokenizer() -> Tokenizer:
         return CharTokenizer()
 
 
-def build_engine() -> IterativeCognitiveEngine:
-    device = auto_device()
+def build_engine(device: torch.device) -> IterativeCognitiveEngine:
     tokenizer = load_tokenizer()
 
     embedder = LookupEmbedder(vocab_size=tokenizer.vocab_size(), embedding_dim=D)
@@ -102,7 +105,7 @@ def build_engine() -> IterativeCognitiveEngine:
         decay_factor=0.999,
         output_max_len=DECODER_MAX_LEN,
         activation_bump=1.0,
-        write_confidence_min=0.0,
+        write_confidence_min=0.35,
         prune_every=4,
         min_edge_weight=1e-3,
         min_node_activation=1e-3,
@@ -125,10 +128,31 @@ def build_engine() -> IterativeCognitiveEngine:
 
 
 def main() -> None:
-    engine = build_engine()
-    print(f"tokenizer: {type(engine._tokenizer).__name__}, "
-          f"vocab={engine._tokenizer.vocab_size()}")
-    output = engine.think("hello")
+    device = auto_device()
+    print(f"device: {device}")
+
+    engine = build_engine(device)
+    print(
+        f"tokenizer: {type(engine._tokenizer).__name__}, "
+        f"vocab={engine._tokenizer.vocab_size()}"
+    )
+
+    if CHECKPOINT_PATH.is_file():
+        step = load_checkpoint_for_inference(
+            engine,
+            CHECKPOINT_PATH,
+            device,
+            embedding_dim=D,
+            tokenizer_name=TOKENIZER_NAME,
+            import_neo4j=True,
+        )
+        print(f"loaded checkpoint from {CHECKPOINT_PATH} (step={step})")
+    else:
+        print(f"no checkpoint at {CHECKPOINT_PATH}; using random weights")
+
+    prompt = os.environ.get("CRANE_PROMPT", "To be or not to be")
+    output = engine.think(prompt)
+    print(f"prompt: {prompt!r}")
     print(f"output: {output!r}")
 
 

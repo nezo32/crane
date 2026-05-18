@@ -161,7 +161,9 @@ class IterativeCognitiveEngine(CognitiveEngine):
                 self._memory.decay(self._config.decay_factor)
 
             self._global_step += 1
-            self._maybe_prune()
+            every = self._config.prune_every
+            if every > 0 and self._global_step % every == 0:
+                self.run_memory_prune()
 
             if confidence_value >= self._config.confidence_threshold:
                 break
@@ -201,26 +203,23 @@ class IterativeCognitiveEngine(CognitiveEngine):
         input_ids: Sequence[int] | torch.Tensor,
         target_ids: Sequence[int] | torch.Tensor,
         *,
-        update_memory: bool = True,
+        use_memory: bool = True,
+        update_memory: bool = False,
+        run_decay: bool = False,
+        run_prune: bool = False,
     ) -> dict[str, Any]:
         """
         One supervised training step for next-token prediction.
 
-        - Runs a SINGLE cognitive pass over `input_ids` with gradients
-          enabled (no multi-iteration unroll).
+        - Runs a SINGLE cognitive pass over `input_ids` with gradients enabled.
         - Teacher-forces the decoder on `target_ids` and returns CE loss.
-          The caller is responsible for the leading BOS in `target_ids`:
-          the decoder is fed `target_ids[:-1]` and predicts `target_ids[1:]`.
-        - If `update_memory` is True, runs the usual write/reinforce/decay/
-          prune hygiene exactly as inference would.
+        - Neo4j side effects are opt-in: set ``use_memory=False`` for a fast
+          GPU-only path (empty retrieval). Set ``update_memory=True`` only on
+          occasional steps to write/reinforce; ``run_decay`` / ``run_prune``
+          should be rare (global graph scans are expensive).
 
-        Returns:
-            {
-                "loss":       Tensor (scalar, has grad — caller .backward()s),
-                "logits":     Tensor (B, T, V),
-                "n_tokens":   non-pad target tokens used in the loss,
-                "confidence": float — mean confidence on the produced thought,
-            }
+        The training loop should call ``set_training_step`` itself each
+        optimizer step — this method does not advance ``training_step``.
         """
         self._set_training(True)
 
@@ -233,7 +232,9 @@ class IterativeCognitiveEngine(CognitiveEngine):
             )
 
         x = self._embedder.embed_tokens(input_tensor)
-        thought, confidence, used_ids, used_weights = self._cognitive_step(x)
+        thought, confidence, used_ids, used_weights = self._cognitive_step(
+            x, use_memory=use_memory
+        )
 
         decoder_input = target_tensor[:, :-1]
         decoder_target = target_tensor[:, 1:]
@@ -252,17 +253,43 @@ class IterativeCognitiveEngine(CognitiveEngine):
             if confidence_value >= self._config.write_confidence_min:
                 self._write_back(thought.detach(), used_ids, used_weights)
                 self._last_used_ids = used_ids
-            if self._config.decay_factor < 1.0:
+            if run_decay and self._config.decay_factor < 1.0:
                 self._memory.decay(self._config.decay_factor)
-            self._global_step += 1
-            self._maybe_prune()
+            if run_prune:
+                self.run_memory_prune()
 
         return {
             "loss": loss,
             "logits": logits,
             "n_tokens": n_tokens,
             "confidence": confidence_value,
+            "used_ids": used_ids,
         }
+
+    @torch.no_grad()
+    def decode_from_prefix_ids(
+        self,
+        prefix_ids: Sequence[int],
+        *,
+        max_tokens: int = 48,
+        use_memory: bool = False,
+    ) -> str:
+        """
+        Greedy decode using the same single-pass stack as training (not the
+        multi-iteration ``think()`` loop). Useful for monitoring train progress.
+        """
+        self._set_training(False)
+        input_tensor = self._to_id_tensor(prefix_ids)
+        x = self._embedder.embed_tokens(input_tensor)
+        thought, _, _, _ = self._cognitive_step(x, use_memory=use_memory)
+        limit = min(max_tokens, self._config.output_max_len)
+        out_ids = self._decoder.generate(
+            thought=thought,
+            bos_id=self._bos_id,
+            eos_id=self._eos_id,
+            max_len=limit,
+        )
+        return self._tokenizer.decode(out_ids[0].tolist())
 
     def _to_id_tensor(
         self,
@@ -303,15 +330,24 @@ class IterativeCognitiveEngine(CognitiveEngine):
     def _cognitive_step(
         self,
         x: torch.Tensor,
+        *,
+        use_memory: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, list[str], torch.Tensor]:
         """
-        One forward pass: salient -> retrieve -> significance -> fuse ->
-        reason -> thought_head. Returns (thought, confidence, used_ids,
-        used_weights). Side-effects: activation bump on retrieved seeds.
-        Gradients flow normally through neural modules; memory tensors enter
-        the graph detached.
+        One forward pass: salient -> [retrieve] -> fuse -> reason -> thought.
+        When ``use_memory`` is False, skips Neo4j entirely (empty memory).
         """
         salient = self._salient(x)
+
+        if not use_memory:
+            empty = torch.zeros(
+                (0, self._memory.dim), dtype=torch.float32, device=self._device
+            )
+            fused = self._fusion(x, empty.unsqueeze(0), None)
+            state = self._reasoner(fused)
+            thought, confidence = self._thought_head(state)
+            return thought, confidence, [], torch.zeros((0,), dtype=torch.float32)
+
         query = salient.mean(dim=1).squeeze(0)
         query_cpu = query.detach().cpu()
 
@@ -393,13 +429,9 @@ class IterativeCognitiveEngine(CognitiveEngine):
                 updates.append((b, a, self._config.reinforce_delta))
             self._memory.reinforce(updates)
 
-    def _maybe_prune(self) -> None:
-        every = self._config.prune_every
-        if every <= 0:
-            return
-        if self._global_step % every != 0:
-            return
-        self._memory.prune(
+    def run_memory_prune(self) -> dict[str, int] | None:
+        """Hard-prune the graph (expensive). Caller decides when to invoke."""
+        return self._memory.prune(
             min_edge_weight=self._config.min_edge_weight,
             min_node_activation=self._config.min_node_activation,
             max_nodes=self._config.max_nodes,

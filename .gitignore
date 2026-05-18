@@ -11,6 +11,8 @@ wheels/
 
 # Training outputs
 checkpoints/
+runs/
 .env
 data/
+data/*.tokens.int32*
 checkpoints/
