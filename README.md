@@ -15,6 +15,8 @@ Alongside iterative inference (`think()` loop), there is a **supervised training
 7. Prediction error updates memory
 8. Attention controls activation dynamics
 
+The full idea (memory as events and consequences, value-weighted links, emotion as a value prediction, and how far the current code is from it) is in [docs/THEORY.md](docs/THEORY.md).
+
 ## Architecture
 
 ```
