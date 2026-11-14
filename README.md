@@ -1,6 +1,6 @@
 # CRANE — Cognitive Retrieval Augmented Neural Engine
 
-> **Start with the theory: [docs/THEORY.md](docs/THEORY.md).** It explains the idea behind CRANE: a thinking network separated from memory, memory as a learning graph of events and consequences, value-weighted links and emotion as a value prediction, the main risks, and how far this scaffold is from the target.
+> **Start with the theory: [docs/THEORY.md](docs/THEORY.md).** It explains the idea behind CRANE: a thinking network separated from memory, memory as a learning graph of events and consequences, value-weighted links and emotion as a value prediction, the main risks, and how far this scaffold is from the target. How the theory will be tested: [docs/RESEARCH_PLAN.md](docs/RESEARCH_PLAN.md).
 
 Research codebase for a **memory-centric cognitive stack**: recurrent *thought formation* grounded in Neo4j (vector similarity + weighted graph traversal), fused with transformers, decoded to tokens. Built for **research and iteration**, not a production LLM replacement.
 
