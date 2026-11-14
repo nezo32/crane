@@ -1,5 +1,7 @@
 # CRANE — Cognitive Retrieval Augmented Neural Engine
 
+> **Start with the theory: [docs/THEORY.md](docs/THEORY.md).** It explains the idea behind CRANE: a thinking network separated from memory, memory as a learning graph of events and consequences, value-weighted links and emotion as a value prediction, the main risks, and how far this scaffold is from the target.
+
 Research codebase for a **memory-centric cognitive stack**: recurrent *thought formation* grounded in Neo4j (vector similarity + weighted graph traversal), fused with transformers, decoded to tokens. Built for **research and iteration**, not a production LLM replacement.
 
 Alongside iterative inference (`think()` loop), there is a **supervised training path** (`pipelines/train.py`): next-token loss on GPT-2 BPE windows, gradients through the neural contour, heuristic **prediction-error feedback** onto graph edges (`engine.feedback`), and serialized **full checkpoints** (weights + optimizer + Neo4j snapshot).
@@ -14,8 +16,6 @@ Alongside iterative inference (`think()` loop), there is a **supervised training
 6. Language is an interface to cognition
 7. Prediction error updates memory
 8. Attention controls activation dynamics
-
-The full idea (memory as events and consequences, value-weighted links, emotion as a value prediction, and how far the current code is from it) is in [docs/THEORY.md](docs/THEORY.md).
 
 ## Architecture
 
